@@ -1,6 +1,8 @@
 package service
 
 import (
+	"encoding/json"
+	"net/http"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -32,4 +34,26 @@ func downstreamRejectsSSEComments(c *gin.Context) bool {
 	}
 	return geminiClientRejectsSSEComments(c.GetHeader("User-Agent")) ||
 		geminiClientRejectsSSEComments(c.GetHeader("X-Goog-Api-Client"))
+}
+
+// geminiGoogleStreamErrorEvent 把网关内部的流错误原因编码成 Google API 风格的 SSE data 事件。
+//
+// 旧格式 "event: error\ndata: {\"error\":\"stream_read_error\"}" 对 go-genai 是致命的：
+// iterateResponseStream 按首个 ":" 前的前缀分派，"event" 前缀直接报 invalid stream chunk（不可重试）；
+// 而 "data: {\"error\":{\"code\":503,...}}" 会被解析成 APIError{Code:503}，调用方（如 Antigravity CLI）
+// 会按可重试错误退避重试。瞬时性错误（读流失败/超时）一律映射为 503 UNAVAILABLE。
+func geminiGoogleStreamErrorEvent(reason string) string {
+	code, status := http.StatusInternalServerError, "INTERNAL"
+	switch reason {
+	case "stream_read_error", "stream_timeout":
+		code, status = http.StatusServiceUnavailable, "UNAVAILABLE"
+	}
+	payload, _ := json.Marshal(map[string]any{
+		"error": map[string]any{
+			"code":    code,
+			"message": reason,
+			"status":  status,
+		},
+	})
+	return "data: " + string(payload) + "\n\n"
 }

@@ -223,12 +223,19 @@ func (s *AntigravityGatewayService) handleGeminiStreamingResponse(c *gin.Context
 
 	// 仅发送一次错误事件，避免多次写入导致协议混乱
 	errorEventSent := false
+	rejectsNamedEvents := downstreamRejectsSSEComments(c)
 	sendErrorEvent := func(reason string) {
 		if errorEventSent || cw.Disconnected() {
 			return
 		}
 		errorEventSent = true
-		_, _ = fmt.Fprintf(c.Writer, "event: error\ndata: {\"error\":\"%s\"}\n\n", reason)
+		// go-genai / python-genai 只认 "data:" 事件，"event: error" 会被判成不可重试的
+		// invalid stream chunk；改发 Google 格式的错误 data 事件，让 SDK 解析成 APIError。
+		if rejectsNamedEvents {
+			_, _ = fmt.Fprint(c.Writer, geminiGoogleStreamErrorEvent(reason))
+		} else {
+			_, _ = fmt.Fprintf(c.Writer, "event: error\ndata: {\"error\":\"%s\"}\n\n", reason)
+		}
 		flusher.Flush()
 	}
 
@@ -249,6 +256,17 @@ func (s *AntigravityGatewayService) handleGeminiStreamingResponse(c *gin.Context
 					logger.LegacyPrintf("service.antigravity_gateway", "SSE line too long (antigravity): max_size=%d error=%v", maxLineSize, ev.err)
 					sendErrorEvent("response_too_large")
 					return &antigravityStreamResult{usage: usage, firstTokenMs: firstTokenMs}, ev.err
+				}
+				// 尚未向客户端写出任何字节（状态行/头部都未提交）时，上游断流可以安全地
+				// 交给 handler 的 failover 循环重试/切号，而不是给客户端一个错误事件。
+				if !c.Writer.Written() {
+					logger.LegacyPrintf("service.antigravity_gateway", "Upstream read error before first byte (antigravity gemini): %v, triggering failover", ev.err)
+					resetAntigravityGeminiStreamHeaders(c)
+					return nil, &UpstreamFailoverError{
+						StatusCode:             http.StatusBadGateway,
+						ResponseBody:           []byte(`{"error":"upstream stream read error before first byte"}`),
+						RetryableOnSameAccount: true,
+					}
 				}
 				sendErrorEvent("stream_read_error")
 				return nil, ev.err
@@ -338,6 +356,15 @@ func (s *AntigravityGatewayService) handleGeminiStreamingResponse(c *gin.Context
 				continue
 			}
 		}
+	}
+}
+
+// resetAntigravityGeminiStreamHeaders 撤销 handleGeminiStreamingResponse 预设但尚未提交的流式响应头，
+// 避免 failover 耗尽后 JSON 错误响应沿用 text/event-stream 的 Content-Type（gin 不会覆盖已有值）。
+func resetAntigravityGeminiStreamHeaders(c *gin.Context) {
+	h := c.Writer.Header()
+	for _, key := range []string{"Content-Type", "Cache-Control", "Connection", "X-Accel-Buffering"} {
+		h.Del(key)
 	}
 }
 
