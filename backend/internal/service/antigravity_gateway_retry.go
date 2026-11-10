@@ -14,6 +14,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/pkg/antigravity"
@@ -536,6 +537,7 @@ urlFallbackLoop:
 				return nil, err
 			}
 
+			attemptStartedAt := time.Now()
 			resp, err = p.httpUpstream.Do(upstreamReq, p.proxyURL, p.account.ID, p.account.Concurrency)
 			if err == nil && resp == nil {
 				err = errors.New("upstream returned nil response")
@@ -557,7 +559,11 @@ urlFallbackLoop:
 					logger.LegacyPrintf("service.antigravity_gateway", "%s URL fallback (connection error): %s -> %s", p.prefix, baseURL, availableURLs[urlIdx+1])
 					continue urlFallbackLoop
 				}
-				if attempt < antigravityMaxRetries {
+				slowClosed := isAntigravitySlowConnectionClosed(err, time.Since(attemptStartedAt))
+				if slowClosed && attempt < antigravityMaxRetries {
+					logger.LegacyPrintf("service.antigravity_gateway", "%s status=request_failed slow_connection_closed skip_same_account_retry attempt=%d/%d error=%v", p.prefix, attempt, antigravityMaxRetries, err)
+				}
+				if attempt < antigravityMaxRetries && !slowClosed {
 					logger.LegacyPrintf("service.antigravity_gateway", "%s status=request_failed retry=%d/%d error=%v", p.prefix, attempt, antigravityMaxRetries, err)
 					if !sleepAntigravityBackoffWithContext(p.ctx, attempt) {
 						logger.LegacyPrintf("service.antigravity_gateway", "%s status=context_canceled_during_backoff", p.prefix)
@@ -567,7 +573,7 @@ urlFallbackLoop:
 				}
 				logger.LegacyPrintf("service.antigravity_gateway", "%s status=request_failed retries_exhausted error=%v", p.prefix, err)
 				setOpsUpstreamError(p.c, 0, safeErr, "")
-				return nil, fmt.Errorf("upstream request failed after retries: %w", err)
+				return nil, &antigravityUpstreamTransportError{err: err}
 			}
 
 			// 统一处理错误响应
@@ -750,6 +756,58 @@ func isAntigravityConnectionError(err error) bool {
 	// 检查连接错误（DNS 失败、连接拒绝）
 	var opErr *net.OpError
 	return errors.As(err, &opErr)
+}
+
+// antigravitySlowConnectionClosedThreshold 上游在等待这么久之后才以 EOF / 连接重置结束请求时，
+// 不再在同一账号上重试：每次重试都可能再空等同样长的时间（实测约 72s），应尽快切换账号。
+// 快速失败的 EOF（如复用到已被对端关闭的 keep-alive 连接）仍按原逻辑同账号重试。
+var antigravitySlowConnectionClosedThreshold = 30 * time.Second
+
+// antigravityUpstreamTransportError 表示同账号重试耗尽（或被提前终止）后仍未拿到上游响应的网络错误。
+// 调用方据此返回 UpstreamFailoverError，让 handler 切换账号。
+type antigravityUpstreamTransportError struct {
+	err error
+}
+
+func (e *antigravityUpstreamTransportError) Error() string {
+	return "upstream request failed after retries: " + e.err.Error()
+}
+
+func (e *antigravityUpstreamTransportError) Unwrap() error { return e.err }
+
+// isAntigravitySlowConnectionClosed 判断是否为「长时间等待后被对端关闭连接」的请求错误。
+func isAntigravitySlowConnectionClosed(err error, elapsed time.Duration) bool {
+	if err == nil || elapsed < antigravitySlowConnectionClosedThreshold {
+		return false
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, syscall.ECONNRESET) {
+		return true
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "connection reset by peer")
+}
+
+// antigravityTransportFailoverError 把同账号重试耗尽的网络错误转换为 UpstreamFailoverError。
+// 仅在客户端仍在线、响应尚未写出时生效；其余情况返回 nil，调用方沿用原有错误响应。
+// 502 而非 503：503 会在全部账号失败后触发 HandleSelectionExhausted 的单账号退避，把请求
+// 重新路由回刚失败的账号。
+func antigravityTransportFailoverError(c *gin.Context, err error, isStickySession bool) *UpstreamFailoverError {
+	var transportErr *antigravityUpstreamTransportError
+	if !errors.As(err, &transportErr) || errors.Is(err, context.Canceled) {
+		return nil
+	}
+	if c != nil {
+		if c.Request != nil && c.Request.Context().Err() != nil {
+			return nil
+		}
+		if c.Writer != nil && c.Writer.Written() {
+			return nil
+		}
+	}
+	return &UpstreamFailoverError{
+		StatusCode:        http.StatusBadGateway,
+		ResponseBody:      []byte(`{"error":{"message":"Upstream request failed after retries"}}`),
+		ForceCacheBilling: isStickySession,
+	}
 }
 
 // shouldAntigravityFallbackToNextURL 判断是否应切换到下一个 URL
