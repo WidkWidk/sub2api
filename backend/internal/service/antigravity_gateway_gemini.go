@@ -187,6 +187,10 @@ func (s *AntigravityGatewayService) ForwardGemini(ctx context.Context, c *gin.Co
 		if c.Request.Context().Err() != nil {
 			return nil, s.writeGoogleError(c, antigravityStatusClientClosed, "Client disconnected before upstream response")
 		}
+		// 同账号网络重试耗尽：交给 handler 切换账号，而不是直接回 502
+		if failoverErr := antigravityTransportFailoverError(c, err, isStickySession); failoverErr != nil {
+			return nil, failoverErr
+		}
 		return nil, s.writeGoogleError(c, http.StatusBadGateway, "Upstream request failed after retries")
 	}
 	resp := result.resp

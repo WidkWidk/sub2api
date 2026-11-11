@@ -423,6 +423,10 @@ func (s *AntigravityGatewayService) handleAntigravityCompatTransportError(c *gin
 	if c.Request.Context().Err() != nil {
 		return s.writeAntigravityCompatError(c, antigravityStatusClientClosed, "client_disconnected", "Client disconnected before upstream response")
 	}
+	// 同账号网络重试耗尽：交给 handler 切换账号，而不是直接回 502
+	if failoverErr := antigravityTransportFailoverError(c, err, false); failoverErr != nil {
+		return failoverErr
+	}
 	return s.writeAntigravityCompatError(c, http.StatusBadGateway, "upstream_error", "Upstream request failed after retries")
 }
 

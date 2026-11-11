@@ -1,6 +1,8 @@
 package service
 
 import (
+	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
@@ -96,4 +98,142 @@ func TestAntigravityGeminiStreamSkipsCommentKeepaliveForGoGenai(t *testing.T) {
 	for _, event := range strings.Split(out, "\n\n") {
 		require.False(t, strings.HasPrefix(event, ":"), "go-genai must never receive an SSE comment event, got %q", event)
 	}
+}
+
+func TestGeminiGoogleStreamErrorEvent(t *testing.T) {
+	cases := []struct {
+		reason string
+		code   int
+		status string
+	}{
+		{"stream_read_error", http.StatusServiceUnavailable, "UNAVAILABLE"},
+		{"stream_timeout", http.StatusServiceUnavailable, "UNAVAILABLE"},
+		{"response_too_large", http.StatusInternalServerError, "INTERNAL"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.reason, func(t *testing.T) {
+			event := geminiGoogleStreamErrorEvent(tc.reason)
+			require.True(t, strings.HasPrefix(event, "data: "))
+			require.True(t, strings.HasSuffix(event, "\n\n"))
+			require.Equal(t, 1, strings.Count(event, "\n\n"))
+			got := decodeGoogleStreamError(t, strings.TrimSuffix(strings.TrimPrefix(event, "data: "), "\n\n"))
+			require.Equal(t, tc.code, got.Code)
+			require.Equal(t, tc.status, got.Status)
+			require.Equal(t, tc.reason, got.Message)
+		})
+	}
+}
+
+type googleStreamErrorInfo struct {
+	Code    int    `json:"code"`
+	Message string `json:"message"`
+	Status  string `json:"status"`
+}
+
+func decodeGoogleStreamError(t *testing.T, payload string) googleStreamErrorInfo {
+	t.Helper()
+	var wrapper struct {
+		Error *googleStreamErrorInfo `json:"error"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(payload), &wrapper))
+	require.NotNil(t, wrapper.Error, "payload must carry an error object: %s", payload)
+	return *wrapper.Error
+}
+
+// runAntigravityGeminiStreamWithReadError 起一条上游流：可选地先发一个 data 事件，然后以读错误中断，
+// 返回下游收到的字节、handler 返回的错误以及 gin.Context。
+func runAntigravityGeminiStreamWithReadError(t *testing.T, userAgent string, sendFirstChunk bool) (string, error, *gin.Context) {
+	t.Helper()
+	gin.SetMode(gin.TestMode)
+	svc := newAntigravityCompatService(config.GatewayConfig{MaxLineSize: defaultMaxLineSize}, nil)
+	c, recorder := newAntigravityCompatContext(http.MethodPost, "/v1beta/models/gemini-3.8-flash:streamGenerateContent", nil)
+	if userAgent != "" {
+		c.Request.Header.Set("User-Agent", userAgent)
+	}
+	reader, writer := io.Pipe()
+	resp := &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"text/event-stream"}}, Body: reader}
+	go func() {
+		if sendFirstChunk {
+			_, _ = io.WriteString(
+				writer,
+				`data: {"response":{"responseId":"resp_1","candidates":[{"content":{"parts":[{"text":"partial"}]}}],"usageMetadata":{"promptTokenCount":8,"candidatesTokenCount":1}}}`+"\n\n",
+			)
+		}
+		_ = writer.CloseWithError(io.ErrUnexpectedEOF)
+	}()
+	_, err := svc.handleGeminiStreamingResponse(c, resp, time.Now())
+	_ = reader.Close()
+	return recorder.Body.String(), err, c
+}
+
+func TestAntigravityGeminiStreamReadErrorUsesGoogleErrorChunkForGoGenai(t *testing.T) {
+	out, err, _ := runAntigravityGeminiStreamWithReadError(t, "google-genai-sdk/1.71.0 gl-go/go1.28-20260721-RC03", true)
+	require.Error(t, err)
+	var failoverErr *UpstreamFailoverError
+	require.False(t, errors.As(err, &failoverErr), "partial stream must not be retried by failover")
+
+	require.Contains(t, out, `"text":"partial"`)
+	require.NotContains(t, out, "event:")
+	events := strings.Split(strings.TrimSuffix(out, "\n\n"), "\n\n")
+	for _, event := range events {
+		require.True(t, strings.HasPrefix(event, "data:"), "go-genai only accepts data events, got %q", event)
+	}
+	last := events[len(events)-1]
+	got := decodeGoogleStreamError(t, strings.TrimSpace(strings.TrimPrefix(last, "data:")))
+	require.Equal(t, http.StatusServiceUnavailable, got.Code)
+	require.Equal(t, "UNAVAILABLE", got.Status)
+	require.Equal(t, "stream_read_error", got.Message)
+}
+
+func TestAntigravityGeminiStreamReadErrorKeepsNamedErrorEventForOrdinaryClients(t *testing.T) {
+	out, err, _ := runAntigravityGeminiStreamWithReadError(t, "curl/8.7.1", true)
+	require.Error(t, err)
+	require.Contains(t, out, `"text":"partial"`)
+	require.True(t, strings.HasSuffix(out, "event: error\ndata: {\"error\":\"stream_read_error\"}\n\n"), "got %q", out)
+}
+
+func TestAntigravityGeminiStreamReadErrorBeforeFirstByteTriggersFailover(t *testing.T) {
+	for _, ua := range []string{"google-genai-sdk/1.71.0 gl-go/go1.28", "curl/8.7.1"} {
+		t.Run(ua, func(t *testing.T) {
+			out, err, c := runAntigravityGeminiStreamWithReadError(t, ua, false)
+			var failoverErr *UpstreamFailoverError
+			require.ErrorAs(t, err, &failoverErr)
+			require.Equal(t, http.StatusBadGateway, failoverErr.StatusCode)
+			require.True(t, failoverErr.RetryableOnSameAccount)
+			require.Empty(t, out)
+			require.False(t, c.Writer.Written(), "response must stay uncommitted so failover can retry")
+			require.Empty(t, c.Writer.Header().Get("Content-Type"), "stream headers must be reset for the failover/error response")
+		})
+	}
+}
+
+func TestAntigravityGeminiStreamTimeoutUsesGoogleErrorChunkForGoGenai(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	svc := newAntigravityCompatService(
+		config.GatewayConfig{MaxLineSize: defaultMaxLineSize, StreamDataIntervalTimeout: 1},
+		nil,
+	)
+	c, recorder := newAntigravityCompatContext(http.MethodPost, "/v1beta/models/gemini-3.8-flash:streamGenerateContent", nil)
+	c.Request.Header.Set("X-Goog-Api-Client", "google-genai-sdk/1.71.0 gl-go/go1.28")
+	reader, writer := io.Pipe()
+	defer func() { _ = writer.Close() }()
+	resp := &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: reader}
+	go func() {
+		_, _ = io.WriteString(
+			writer,
+			`data: {"response":{"responseId":"resp_1","candidates":[{"content":{"parts":[{"text":"partial"}]}}]}}`+"\n\n",
+		)
+	}()
+	_, err := svc.handleGeminiStreamingResponse(c, resp, time.Now())
+	_ = reader.Close()
+	require.Error(t, err)
+
+	out := recorder.Body.String()
+	require.NotContains(t, out, "event:")
+	events := strings.Split(strings.TrimSuffix(out, "\n\n"), "\n\n")
+	last := events[len(events)-1]
+	require.True(t, strings.HasPrefix(last, "data:"), "got %q", last)
+	got := decodeGoogleStreamError(t, strings.TrimSpace(strings.TrimPrefix(last, "data:")))
+	require.Equal(t, http.StatusServiceUnavailable, got.Code)
+	require.Equal(t, "stream_timeout", got.Message)
 }
